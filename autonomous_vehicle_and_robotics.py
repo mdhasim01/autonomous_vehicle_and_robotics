@@ -3,6 +3,15 @@ import sys
 import math
 import random
 import time
+import numpy as np
+import os
+from data_collector import DataCollector
+try:
+    from ml_models import BehaviorCloningModel, HazardDetectionModel
+    ML_AVAILABLE = True
+except ImportError:
+    print("TensorFlow not available. Machine Learning features will be disabled.")
+    ML_AVAILABLE = False
 
 # --- Constants ---
 # Screen dimensions
@@ -514,12 +523,47 @@ class Vehicle:
         self.manual_steering = 0 # -1 for left, 1 for right, 0 for none
         self.manual_accel = 0 # 1 for accel, -1 for brake, 0 for none
         self.last_off_track_warning_time = 0 # Cooldown for off-track warning
+        
+        # Machine Learning and Data Collection
+        self.data_collector = None
+        self.recording = False
+        self.frame_counter = 0
+        self.previous_angle = start_angle
+        self.previous_speed = 0.0
+        
+        # ML Models
+        self.bc_model = None if not ML_AVAILABLE else BehaviorCloningModel()
+        self.hazard_model = None if not ML_AVAILABLE else HazardDetectionModel()
+        self.use_ml_control = False
 
     def set_popup_manager(self, manager):
         self.popup_manager = manager
 
     def set_warning_manager(self, manager):
         self.warning_manager = manager
+        
+    def set_data_collector(self, collector):
+        self.data_collector = collector
+        
+    def toggle_recording(self):
+        self.recording = not self.recording
+        if self.recording:
+            self._show_popup("RECORDING STARTED")
+        else:
+            self._show_popup("RECORDING STOPPED")
+        return self.recording
+        
+    def toggle_ml_control(self):
+        if not ML_AVAILABLE:
+            self._show_popup("ML FEATURES NOT AVAILABLE")
+            return False
+            
+        self.use_ml_control = not self.use_ml_control
+        if self.use_ml_control:
+            self._show_popup("ML CONTROL ENABLED")
+        else:
+            self._show_popup("ML CONTROL DISABLED")
+        return self.use_ml_control
 
     def _show_popup(self, text):
         if self.popup_manager:
@@ -531,13 +575,218 @@ class Vehicle:
 
     def update(self, dt, obstacles, hazards):
         """Main update method, routes to auto or manual logic."""
-        if self.control_mode == AUTO:
+        # Save previous state for data collection
+        previous_x, previous_y = self.x, self.y
+        
+        # ML-based control if enabled
+        if self.use_ml_control and self.control_mode == AUTO and ML_AVAILABLE:
+            self._update_ml(dt, obstacles, hazards)
+        elif self.control_mode == AUTO:
             self._update_auto(dt, obstacles, hazards)
         else: # MANUAL
             self._update_manual(dt, obstacles, hazards)
 
         # Common physics update (apply speed, check collisions)
         self._apply_physics_and_collisions(dt, obstacles, hazards)
+        
+        # Record data if we're in recording mode
+        if self.recording and self.data_collector:
+            self.frame_counter += 1
+            
+            # Prepare vehicle state
+            vehicle_state = {
+                'x': self.x,
+                'y': self.y,
+                'angle': self.angle,
+                'speed': self.speed,
+                'lateral_offset': self.current_lateral_offset
+            }
+            
+            # Prepare control inputs
+            if self.control_mode == AUTO:
+                control_inputs = {
+                    'steering': angle_diff(self.previous_angle, self.angle),
+                    'acceleration': (self.speed - self.previous_speed)
+                }
+            else:
+                control_inputs = {
+                    'steering': self.manual_steering,
+                    'acceleration': self.manual_accel
+                }
+            
+            # Get nearest hazard
+            nearest_hazard = self._find_nearest_hazard(hazards)
+            
+            # Get path info
+            path_info = {
+                'target_x': self.path[self.current_path_index][0],
+                'target_y': self.path[self.current_path_index][1],
+                'segment_index': self.current_path_index
+            }
+            
+            # Record driving frame
+            self.data_collector.record_driving_frame(
+                vehicle_state, 
+                control_inputs, 
+                nearest_hazard, 
+                path_info
+            )
+            
+            # Capture sensor data every 5 frames to reduce data size
+            if self.frame_counter % 5 == 0:
+                lidar_data = self._capture_lidar_data(obstacles, hazards)
+                camera_data = self._capture_camera_view()
+                image_filename = self.data_collector.save_camera_image(camera_data, self.frame_counter)
+                self.data_collector.record_sensor_frame(lidar_data, image_filename)
+            
+            # Store previous values for calculating deltas
+            self.previous_angle = self.angle
+            self.previous_speed = self.speed
+
+    def _update_ml(self, dt, obstacles, hazards):
+        """ML-based driving logic using trained models"""
+        if not self.bc_model or not ML_AVAILABLE:
+            self._show_popup("ML MODEL NOT AVAILABLE - SWITCHING TO AUTO")
+            self.use_ml_control = False
+            self._update_auto(dt, obstacles, hazards)
+            return
+            
+        # Prepare state vector for behavior cloning model
+        state_vector = [
+            self.x / WORLD_WIDTH,  # Normalize position
+            self.y / WORLD_HEIGHT, 
+            math.sin(math.radians(self.angle)),  # Use sin/cos for angle to avoid discontinuity
+            math.cos(math.radians(self.angle)),
+            self.speed / VEHICLE_MAX_SPEED,  # Normalize speed
+            self.current_lateral_offset / LANE_WIDTH,  # Normalize offset
+        ]
+        
+        # Get path information - relative target position
+        target_index = self.current_path_index
+        target_pos = self.path[target_index]
+        next_target_index = (target_index + 1) % len(self.path)
+        next_target_pos = self.path[next_target_index]
+        
+        # Add normalized path targets
+        state_vector.extend([
+            target_pos[0] / WORLD_WIDTH,
+            target_pos[1] / WORLD_HEIGHT,
+            next_target_pos[0] / WORLD_WIDTH,
+            next_target_pos[1] / WORLD_HEIGHT
+        ])
+        
+        # Use hazard detection model on camera data
+        camera_view = self._capture_camera_view()
+        if self.hazard_model:
+            hazard_prediction = self.hazard_model.predict(camera_view)
+            # hazard_prediction is [none_prob, pothole_prob, speedbreaker_prob]
+            hazard_type = np.argmax(hazard_prediction)
+            if hazard_type == 1:  # pothole
+                self._show_popup("ML: Pothole detected!")
+            elif hazard_type == 2:  # speedbreaker
+                self._show_popup("ML: Speed breaker detected!")
+        
+        # Get behavior prediction from BC model
+        prediction = self.bc_model.predict(state_vector)
+        
+        # Apply predicted steering and acceleration
+        steering = prediction[0]  # -1 to 1
+        acceleration = prediction[1]  # -1 to 1
+        
+        # Apply steering
+        turn_rate = VEHICLE_TURN_RATE * dt * 60
+        self.angle += steering * turn_rate
+        self.angle %= 360
+        
+        # Apply acceleration
+        if acceleration > 0:
+            self.speed += VEHICLE_ACCEL * acceleration * dt * 60
+            self.speed = min(self.speed, VEHICLE_MAX_SPEED)
+        else:
+            self.speed += VEHICLE_BRAKE_ACCEL * acceleration * dt * 60  # acceleration is negative
+            self.speed = max(0, self.speed)
+
+    def _find_nearest_hazard(self, hazards):
+        """Find the nearest hazard and return its info"""
+        nearest_hazard = None
+        min_dist = float('inf')
+        
+        for hz_type, hz_rect, hz_center in hazards:
+            dist = distance((self.x, self.y), hz_center)
+            if dist < min_dist:
+                min_dist = dist
+                nearest_hazard = {
+                    'type': hz_type,
+                    'distance': dist,
+                    'center': hz_center
+                }
+        
+        return nearest_hazard
+
+    def _capture_lidar_data(self, obstacles, hazards):
+        """Simulate LiDAR readings"""
+        lidar_data = []
+        
+        for i in range(LIDAR_NUM_RAYS):
+            angle_offset = (i / (LIDAR_NUM_RAYS - 1) - 0.5) * LIDAR_ANGLE_SPREAD if LIDAR_NUM_RAYS > 1 else 0
+            ray_angle_deg = self.angle + angle_offset
+            ray_angle_rad = math.radians(ray_angle_deg)
+            
+            # Cast ray and find intersection
+            ray_end = (self.x + LIDAR_RANGE * math.cos(ray_angle_rad),
+                      self.y + LIDAR_RANGE * math.sin(ray_angle_rad))
+            
+            min_hit_dist = LIDAR_RANGE
+            hit_point = None
+            
+            # Combine static and hazard rects for ray detection
+            combined_obstacles = obstacles + [h[1] for h in hazards]
+            
+            for obs_rect in combined_obstacles:
+                # Simple line-rect intersection using clipline
+                try:
+                    clipped_line = obs_rect.clipline((self.x, self.y), ray_end)
+                    if clipped_line:
+                        p1, p2 = clipped_line
+                        # Find intersection point closest to vehicle
+                        d1 = distance((self.x, self.y), p1)
+                        d2 = distance((self.x, self.y), p2)
+                        dist = min(d1, d2)
+                        
+                        if dist < min_hit_dist:
+                            min_hit_dist = dist
+                            hit_point = p1 if d1 < d2 else p2
+                except TypeError:
+                    pass # Ignore if clipline fails
+            
+            # Record distance or max range if no hit
+            lidar_data.append((angle_offset, min_hit_dist))
+        
+        return lidar_data
+
+    def _capture_camera_view(self):
+        """Generate a simplified representation of what the camera sees"""
+        # Create a simple image array of 50x100
+        camera_view = np.zeros((50, 100))
+        
+        # In a real implementation, we'd extract a view from the rendered world
+        # Here we'll just generate a very basic simulated view for ML purposes
+        
+        # Create a gradient that represents distance ahead
+        for y in range(camera_view.shape[0]):
+            camera_view[y, :] = y / camera_view.shape[0]
+        
+        # Add a "road" based on vehicle angle and lateral offset
+        road_center = int(camera_view.shape[1] / 2 + self.current_lateral_offset * 5)
+        road_width = int(LANE_WIDTH * 2 * 0.7)  # Scale for image size
+        
+        for x in range(max(0, road_center - road_width), min(camera_view.shape[1], road_center + road_width)):
+            camera_view[:, x] += 0.3  # Brighten road area
+        
+        # Simulate any nearby hazards
+        # (In a real implementation, this would be based on the actual rendered view)
+        
+        return camera_view
 
     def _update_auto(self, dt, obstacles, hazards):
         """ Autonomous driving logic """
@@ -992,14 +1241,23 @@ def main():
     warning_manager = WarningManager()
     vehicle.set_popup_manager(popup_manager)
     vehicle.set_warning_manager(warning_manager)
-
+    
+    # Create data collector and setup for ML
+    data_collector = DataCollector()
+    vehicle.set_data_collector(data_collector)
+    
     # Initial camera position centered on vehicle
     camera_offset_x = vehicle.x - SCREEN_WIDTH // 2
     camera_offset_y = vehicle.y - SCREEN_HEIGHT // 2
 
     print("Starting simulation loop...")
-    print(f"Controls: Arrows = Move (Manual), M = Switch Mode, ESC = Quit")
+    print(f"Controls: Arrows = Move (Manual), M = Switch Mode, R = Toggle Recording, L = Toggle ML (if available), ESC = Quit")
     vehicle._show_popup("AUTOMATIC MODE ENGAGED") # Initial mode message
+    
+    # Define new control keys
+    KEY_RECORD = pygame.K_r
+    KEY_ML_TOGGLE = pygame.K_l
+    KEY_TRAIN = pygame.K_t
 
     while running:
         # Calculate delta time
@@ -1031,6 +1289,52 @@ def main():
                         vehicle.state = "NORMAL"
                         vehicle.target_speed = VEHICLE_MAX_SPEED # Resume normal auto speed target
                         vehicle.evasion_target_offset = 0 # Ensure no residual evasion target
+                
+                # Toggle Recording
+                if event.key == KEY_RECORD:
+                    is_recording = vehicle.toggle_recording()
+                    if not is_recording:
+                        # Save data if recording was stopped
+                        session_dir = data_collector.save_datasets()
+                        vehicle._show_popup(f"Data saved to {session_dir}")
+                
+                # Toggle ML control
+                if event.key == KEY_ML_TOGGLE and ML_AVAILABLE:
+                    vehicle.toggle_ml_control()
+                
+                # Train ML model
+                if event.key == KEY_TRAIN and ML_AVAILABLE:
+                    # If recording is active, stop it first
+                    if vehicle.recording:
+                        vehicle.toggle_recording()
+                        data_collector.save_datasets()
+                    
+                    # Check if there's any data to train from
+                    if os.path.exists("datasets"):
+                        session_dirs = [os.path.join("datasets", d) for d in os.listdir("datasets") if os.path.isdir(os.path.join("datasets", d))]
+                        if session_dirs:
+                            vehicle._show_popup("Training ML models... (may take some time)")
+                            # Use most recent session by default
+                            latest_session = max(session_dirs, key=os.path.getmtime)
+                            
+                            # Train the models
+                            if vehicle.bc_model:
+                                try:
+                                    vehicle.bc_model.train(latest_session)
+                                    vehicle._show_popup("Behavior Cloning model trained!")
+                                except Exception as e:
+                                    vehicle._show_popup(f"BC training error: {str(e)[:20]}")
+                            
+                            if vehicle.hazard_model:
+                                try:
+                                    vehicle.hazard_model.train(latest_session)
+                                    vehicle._show_popup("Hazard Detection model trained!")
+                                except Exception as e:
+                                    vehicle._show_popup(f"HD training error: {str(e)[:20]}")
+                        else:
+                            vehicle._show_popup("No training data found!")
+                    else:
+                        vehicle._show_popup("No datasets directory found!")
 
             # Manual Control Input (Key Down/Up) - Only active in MANUAL mode
             if vehicle.control_mode == MANUAL:
@@ -1073,7 +1377,7 @@ def main():
         screen.blit(world_surface, (-camera_offset_x, -camera_offset_y))
 
         # Draw vehicle and its sensors
-        vehicle.draw(screen, camera_offset)
+        vehicle.draw(screen, camera_offset, obstacles, hazards)
 
         # Draw popups (general info)
         popup_manager.draw(screen)
@@ -1096,6 +1400,13 @@ def main():
         else: # Manual Mode HUD
              hud_text.append(f"Manual Input: A={vehicle.manual_accel}, S={vehicle.manual_steering}")
 
+        # Add ML and recording status
+        if ML_AVAILABLE:
+            ml_status = "ENABLED" if vehicle.use_ml_control else "DISABLED"
+            hud_text.append(f"ML Control: {ml_status}")
+        
+        rec_status = "RECORDING" if vehicle.recording else "NOT RECORDING"
+        hud_text.append(f"Data Collection: {rec_status}")
 
         for i, line in enumerate(hud_text):
             color = mode_color if "Mode:" in line else WHITE # Highlight mode line
@@ -1107,14 +1418,22 @@ def main():
 
         # Add control hint
         try:
-            hint_surf = default_font.render(f"[{pygame.key.name(KEY_MODE_SWITCH).upper()}] Switch Mode | [ESC] Quit", True, WHITE)
-            screen.blit(hint_surf, (10, SCREEN_HEIGHT - 30))
+            hint_1 = f"[{pygame.key.name(KEY_MODE_SWITCH).upper()}] Switch Mode | [{pygame.key.name(KEY_RECORD).upper()}] Toggle Recording"
+            hint_2 = f"[{pygame.key.name(KEY_ML_TOGGLE).upper()}] Toggle ML | [{pygame.key.name(KEY_TRAIN).upper()}] Train ML"
+            hint_surf_1 = default_font.render(hint_1, True, WHITE)
+            hint_surf_2 = default_font.render(hint_2, True, WHITE)
+            screen.blit(hint_surf_1, (10, SCREEN_HEIGHT - 45))
+            screen.blit(hint_surf_2, (10, SCREEN_HEIGHT - 25))
         except Exception as e:
              print(f"Error rendering hint text: {e}")
 
         # --- Display Update ---
         pygame.display.flip()
 
+    # When exiting, save any remaining data if recording
+    if vehicle.recording:
+        data_collector.save_datasets()
+    
     print("Exiting simulation.")
     pygame.quit()
     sys.exit()
