@@ -10,7 +10,7 @@ try:
     from ml_models import BehaviorCloningModel, HazardDetectionModel
     ML_AVAILABLE = True
 except ImportError:
-    print("TensorFlow not available. Machine Learning features will be disabled.")
+    print("PyTorch not available. Machine Learning features will be disabled.")
     ML_AVAILABLE = False
 
 # --- Constants ---

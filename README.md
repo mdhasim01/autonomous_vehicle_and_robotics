@@ -1,6 +1,6 @@
 # Autonomous Vehicle and Robotics Simulation
 
-A Python-based simulation for autonomous vehicle control with machine learning capabilities.
+A Python-based simulation for autonomous vehicle control with PyTorch machine learning capabilities.
 
 ## Features
 
@@ -30,12 +30,25 @@ The project supports two ML approaches:
 ## Getting Started
 
 1. Make sure you have Python 3.7+ installed
-2. Install required packages:
+2. Create and activate the virtual environment:
    ```
-   pip install pygame numpy tensorflow
+   python3 -m venv venv
+   source venv/bin/activate  # On Windows: venv\Scripts\activate
    ```
-3. Run the simulation:
+
+3. Install required packages:
    ```
+   pip install -r requirements.txt
+   ```
+
+4. Run the simulation:
+   ```
+   ./run.sh  # On Windows: run.bat
+   ```
+   
+   Alternatively:
+   ```
+   source venv/bin/activate
    python autonomous_vehicle_and_robotics.py
    ```
 
@@ -46,3 +59,30 @@ Data is collected in the `datasets` directory when recording is active. Each ses
 - `sensor_data.csv`: Sensor readings
 - `hazard_encounters.csv`: Specific hazard interaction data
 - Camera frame images
+
+## Training ML Models
+
+### Using the Simulation Interface
+1. Start recording data by pressing **R**
+2. Drive the vehicle to collect training data
+3. Stop recording by pressing **R** again
+4. Train models by pressing **T**
+5. Enable ML-based control by pressing **L**
+
+### Using the Training Utility
+The project includes a dedicated training utility:
+
+```
+# List available datasets
+./train_models.py --list
+
+# Train using the latest dataset
+./train_models.py --latest
+
+# Train a specific model type
+./train_models.py --latest --models behavior
+./train_models.py --latest --models hazard
+
+# Train using a specific dataset
+./train_models.py --dataset session_1747503003
+```
